@@ -1,84 +1,87 @@
 #!/bin/bash
 
-# === Konfigurasi dasar ===
-USER_NAME="riyan"
-PASSWORD="saputra"
-SSH_PORT=22
-WS_PORT=80
+echo "🛠 Memulai instalasi SSH WebSocket Server..."
 
-# Dapatkan IP publik otomatis
-PUB_IP=$(curl -s ipv4.icanhazip.com)
-
-echo "[*] Memastikan port 80 tidak digunakan..."
-fuser -k 80/tcp > /dev/null 2>&1
-
-# === Install dependensi ===
-echo "[*] Menginstall dependensi..."
+# 1. Pastikan Python terinstall
 apt update -y
-apt install -y python3 python3-pip screen net-tools curl socat
+apt install -y python3 -y
 
-# === Buat user SSH ===
-if ! id "$USER_NAME" &>/dev/null; then
-  echo "[*] Membuat user SSH $USER_NAME..."
-  useradd -m -s /bin/bash "$USER_NAME"
-  echo "$USER_NAME:$PASSWORD" | chpasswd
-fi
+# 2. Hapus script lama jika ada
+rm -f /etc/sshws/ws-server.py
 
-# === Buat direktori dan script WebSocket ===
+# 3. Buat direktori dan script baru
 mkdir -p /etc/sshws
-cat <<EOF >/etc/sshws/ws-server.py
+
+cat << 'EOF' > /etc/sshws/ws-server.py
 #!/usr/bin/env python3
-import socket, threading
+import socket, threading, os
 
-LISTEN_HOST = "0.0.0.0"
-LISTEN_PORT = $WS_PORT
-FORWARD_HOST = "127.0.0.1"
-FORWARD_PORT = $SSH_PORT
+LISTEN_HOST = '0.0.0.0'
+LISTEN_PORT = 80
+BUFFER_SIZE = 1024
 
-def handle(client_sock):
+def handle(client_socket):
     try:
-        data = client_sock.recv(1024)
-        if b"Upgrade: websocket" in data or b"HTTP/1.1" in data:
-            response = (
-                b"HTTP/1.1 101 Switching Protocols\r\n"
-                b"Upgrade: websocket\r\n"
-                b"Connection: Upgrade\r\n"
-                b"\r\n"
-            )
-            client_sock.send(response)
-        else:
-            client_sock.send(b"HTTP/1.1 400 Bad Request\r\n\r\nInvalid Payload\r\n")
-            client_sock.close()
-            return
-
-        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_sock.connect((FORWARD_HOST, FORWARD_PORT))
-        threading.Thread(target=pipe, args=(client_sock, server_sock)).start()
-        threading.Thread(target=pipe, args=(server_sock, client_sock)).start()
-    except Exception as e:
-        client_sock.close()
-
-def pipe(src, dst):
-    try:
-        while True:
-            data = src.recv(1024)
-            if not data:
+        req = b""
+        while b"\r\n\r\n" not in req:
+            chunk = client_socket.recv(BUFFER_SIZE)
+            if not chunk:
                 break
-            dst.sendall(data)
-    except:
-        pass
-    finally:
-        src.close()
-        dst.close()
+            req += chunk
+
+        header = req.decode(errors="ignore")
+        print("=== HEADER DITERIMA ===")
+        print(header)
+        print("========================")
+
+        if "upgrade" in header.lower() and "websocket" in header.lower():
+            response = (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n\r\n"
+            )
+            client_socket.send(response.encode())
+
+            try:
+                target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                target.connect(("127.0.0.1", 22))
+
+                def forward(src, dst):
+                    try:
+                        while True:
+                            data = src.recv(BUFFER_SIZE)
+                            if not data:
+                                break
+                            dst.sendall(data)
+                    finally:
+                        src.close()
+                        dst.close()
+
+                threading.Thread(target=forward, args=(client_socket, target)).start()
+                threading.Thread(target=forward, args=(target, client_socket)).start()
+
+            except Exception as e:
+                print(f"[!] Gagal konek ke SSH: {e}")
+                client_socket.close()
+        else:
+            client_socket.send(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            client_socket.close()
+
+    except Exception as e:
+        print(f"[!] Error: {e}")
+        client_socket.close()
 
 def start():
+    os.system("fuser -k 80/tcp")
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((LISTEN_HOST, LISTEN_PORT))
     sock.listen(100)
-    print(f"[*] SSH WebSocket aktif di ws://{LISTEN_HOST}:{LISTEN_PORT}")
+    print(f"[+] Listening on {LISTEN_HOST}:{LISTEN_PORT}...")
+
     while True:
-        client, _ = sock.accept()
+        client, addr = sock.accept()
+        print(f"[+] Koneksi dari {addr[0]}:{addr[1]}")
         threading.Thread(target=handle, args=(client,)).start()
 
 if __name__ == "__main__":
@@ -87,8 +90,8 @@ EOF
 
 chmod +x /etc/sshws/ws-server.py
 
-# === Tambah systemd service ===
-cat <<EOF >/etc/systemd/system/sshws.service
+# 4. Buat systemd service
+cat << EOF > /etc/systemd/system/sshws.service
 [Unit]
 Description=SSH over WebSocket Service
 After=network.target
@@ -102,20 +105,17 @@ User=root
 WantedBy=multi-user.target
 EOF
 
-# === Enable dan start service ===
-echo "[*] Menjalankan dan mengaktifkan layanan sshws..."
+# 5. Reload dan aktifkan service
 systemctl daemon-reexec
 systemctl daemon-reload
 systemctl enable sshws
 systemctl restart sshws
 
-# === Output informasi koneksi ===
-echo
-echo "✅ SSH WebSocket berhasil dipasang!"
-echo "▶ IP VPS     : $PUB_IP"
-echo "▶ SSH Port   : $SSH_PORT"
-echo "▶ WS Port    : $WS_PORT (support HTTP Injector, HTTP Custom, dll)"
-echo "▶ Payload    :"
-echo
-echo "GET / HTTP/1.1[crlf]Host: $PUB_IP[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]"
-echo
+# 6. Output sukses
+echo "✅ SSH WebSocket server berhasil diinstall dan dijalankan di port 80."
+echo "Gunakan payload seperti:"
+echo ""
+echo "GET / HTTP/1.1[crlf]"
+echo "Host: $(curl -s ifconfig.me)[crlf]"
+echo "Upgrade: websocket[crlf]"
+echo "Connection: Upgrade[crlf][crlf]"
